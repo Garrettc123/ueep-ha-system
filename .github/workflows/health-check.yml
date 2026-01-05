@@ -1,0 +1,241 @@
+name: Continuous Health Check
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check application health
+        id: app-health
+        continue-on-error: true
+        run: |
+          echo "Checking application health..."
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Application is healthy"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Application is unhealthy (HTTP $response)"
+            exit 1
+          fi
+
+      - name: Check database connectivity
+        id: db-check
+        continue-on-error: true
+        run: |
+          echo "Checking database connectivity..."
+          
+          health_response=$(curl -s http://localhost/health || echo '{}')
+          db_status=$(echo "$health_response" | jq -r '.checks.database // "unknown"')
+          
+          if [ "$db_status" = "healthy" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Database is healthy"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Database is unhealthy"
+            exit 1
+          fi
+
+      - name: Check cache availability
+        id: cache-check
+        continue-on-error: true
+        run: |
+          echo "Checking cache availability..."
+          
+          health_response=$(curl -s http://localhost/health || echo '{}')
+          cache_status=$(echo "$health_response" | jq -r '.checks.cache // "unknown"')
+          
+          if [ "$cache_status" = "healthy" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Cache is healthy"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Cache is unhealthy"
+            exit 1
+          fi
+
+      - name: Check metrics endpoint
+        id: metrics-check
+        continue-on-error: true
+        run: |
+          echo "Checking metrics endpoint..."
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/metrics || echo "000")
+          
+          if [ "$response" = "200" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Metrics endpoint is responding"
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+            echo "❌ Metrics endpoint is not responding"
+            exit 1
+          fi
+
+      - name: Verify load balancing
+        id: lb-check
+        continue-on-error: true
+        run: |
+          echo "Verifying load balancing..."
+          
+          declare -A nodes
+          
+          for i in {1..10}; do
+            node=$(curl -s http://localhost/ | jq -r '.node // "unknown"')
+            nodes[$node]=1
+          done
+          
+          node_count=${#nodes[@]}
+          
+          if [ $node_count -ge 2 ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+            echo "✅ Load balancing working ($node_count nodes responding)"
+          else
+            echo "status=degraded" >> $GITHUB_OUTPUT
+            echo "⚠️ Load balancing degraded (only $node_count node responding)"
+          fi
+
+      - name: Collect system metrics
+        id: metrics
+        if: always()
+        run: |
+          echo "Collecting system metrics..."
+          
+          # Get Prometheus metrics
+          metrics=$(curl -s http://localhost/metrics || echo "")
+          
+          # Extract key metrics
+          request_total=$(echo "$metrics" | grep '^ueep_http_requests_total' | head -1 | awk '{print $2}')
+          request_duration=$(echo "$metrics" | grep '^ueep_http_request_duration_seconds_sum' | head -1 | awk '{print $2}')
+          
+          echo "Total requests: ${request_total:-0}"
+          echo "Request duration: ${request_duration:-0}s"
+          
+          echo "request_total=${request_total:-0}" >> $GITHUB_OUTPUT
+          echo "request_duration=${request_duration:-0}" >> $GITHUB_OUTPUT
+
+      - name: Generate health report
+        if: always()
+        run: |
+          echo "# Health Check Report" > health-report.md
+          echo "" >> health-report.md
+          echo "**Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> health-report.md
+          echo "**Workflow Run:** ${{ github.run_id }}" >> health-report.md
+          echo "" >> health-report.md
+          echo "## Component Status" >> health-report.md
+          echo "" >> health-report.md
+          echo "| Component | Status |" >> health-report.md
+          echo "|-----------|--------|" >> health-report.md
+          echo "| Application | ${{ steps.app-health.outputs.status || 'unknown' }} |" >> health-report.md
+          echo "| Database | ${{ steps.db-check.outputs.status || 'unknown' }} |" >> health-report.md
+          echo "| Cache | ${{ steps.cache-check.outputs.status || 'unknown' }} |" >> health-report.md
+          echo "| Metrics | ${{ steps.metrics-check.outputs.status || 'unknown' }} |" >> health-report.md
+          echo "| Load Balancing | ${{ steps.lb-check.outputs.status || 'unknown' }} |" >> health-report.md
+          echo "" >> health-report.md
+          echo "## Metrics" >> health-report.md
+          echo "" >> health-report.md
+          echo "- **Total Requests:** ${{ steps.metrics.outputs.request_total || 'N/A' }}" >> health-report.md
+          echo "- **Request Duration:** ${{ steps.metrics.outputs.request_duration || 'N/A' }}s" >> health-report.md
+          
+          cat health-report.md
+
+      - name: Upload health report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-report-${{ github.run_id }}
+          path: health-report.md
+          retention-days: 7
+
+      - name: Notify Slack on health issue
+        if: |
+          failure() && (
+            steps.app-health.outputs.status == 'unhealthy' ||
+            steps.db-check.outputs.status == 'unhealthy' ||
+            steps.cache-check.outputs.status == 'unhealthy'
+          )
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "⚠️ UEEP HA System health issue detected!",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "⚠️ Health Check Failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Application:*\n${{ steps.app-health.outputs.status || 'unknown' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Database:*\n${{ steps.db-check.outputs.status || 'unknown' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Cache:*\n${{ steps.cache-check.outputs.status || 'unknown' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Load Balancing:*\n${{ steps.lb-check.outputs.status || 'unknown' }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+                  }
+                }
+              ]
+            }
+
+      - name: Create GitHub issue on persistent failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Health Check Failed: ' + new Date().toISOString(),
+              body: `## Health Check Failure
+              
+              **Workflow Run:** ${{ github.run_id }}
+              **Timestamp:** ${new Date().toISOString()}
+              
+              ### Component Status
+              
+              - **Application:** ${{ steps.app-health.outputs.status || 'unknown' }}
+              - **Database:** ${{ steps.db-check.outputs.status || 'unknown' }}
+              - **Cache:** ${{ steps.cache-check.outputs.status || 'unknown' }}
+              - **Metrics:** ${{ steps.metrics-check.outputs.status || 'unknown' }}
+              - **Load Balancing:** ${{ steps.lb-check.outputs.status || 'unknown' }}
+              
+              ### Action Required
+              
+              Please investigate the failing components and take corrective action.
+              
+              [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['health-check', 'incident', 'automated']
+            });
+            console.log('Created issue #' + issue.data.number);
